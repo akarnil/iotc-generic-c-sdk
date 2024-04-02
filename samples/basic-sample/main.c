@@ -17,6 +17,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
+#include <dirent.h>
 
 // windows compatibility
 #if defined(_WIN32) || defined(_WIN64)
@@ -32,6 +33,23 @@
 #define APP_VERSION "00.01.00"
 #define STRINGS_ARE_EQUAL 0
 #define FREE(x) if ((x)) { free(x); (x) = NULL; }
+#define REPEAT_SENT_TELEMETRY
+
+char device_id[256] = {};
+char company_id[256] = {};
+char environment[256] = {};
+char iotc_server_cert_path[4096] = {};
+char sdk_id[256] = {};
+
+char connection_type_str[256] = {};
+IotConnectConnectionType connection_type = 0; 
+
+char auth_type[256] = {};
+char commands_list_path[4096] = {};
+
+char** available_scripts = NULL;
+int available_scripts_count = 0;
+
 
 typedef struct telemetry_attribute
 {
@@ -72,19 +90,102 @@ static void on_connection_status(IotConnectMqttStatus status) {
 static void on_command(IotclC2dEventData data) {
     const char *command = iotcl_c2d_get_command(data);
     const char *ack_id = iotcl_c2d_get_ack_id(data);
-    if (command) {
-        printf("Command %s received with %s ACK ID\n", command, ack_id ? ack_id : "no");
-        // could be a command without acknowledgement, so ackID can be null
-        if (ack_id) {
-            iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Not implemented");
-        }
-    } else {
-        // could be a command without acknowledgement, so ackID can be null
+
+    printf("Command %s received with %s ACK ID\n", command, ack_id ? ack_id : "no");
+
+    if (!command)
+    {
         printf("Failed to parse command\n");
         if (ack_id) {
             iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Internal error");
         }
     }
+
+    int delim_pos = strlen(command);
+    for (int i = 0; i < (int)strlen(command); i++)
+    {
+        if (command[i] == ' ')
+        {
+            delim_pos = i;
+            break;
+        }
+    }
+    
+    bool command_exists = false;
+    for (int i = 0; i < available_scripts_count; i++)
+    {
+        if (strncmp(available_scripts[i], command, delim_pos) == STRINGS_ARE_EQUAL)
+        {
+            command_exists = true;
+            break;
+        }
+    }
+
+    if (!command_exists)
+    {  
+        if (ack_id)
+        {
+            iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Command does not exist locally, Skipping");
+        }
+        printf("Command does not exist locally, Skipping\n");
+        return;
+    }
+
+    bool need_forward_slash = (commands_list_path[strlen(commands_list_path) - 1] != '/');
+    int total_command_length = strlen(commands_list_path) + strlen(command) + (int)need_forward_slash;
+    char* final_command_path = calloc(total_command_length, sizeof(command[0]));
+    
+    strcpy(final_command_path, commands_list_path);
+    if(need_forward_slash)
+    {
+        final_command_path[strlen(commands_list_path)] = '/';
+    }
+    strcpy(final_command_path + strlen(final_command_path), command);
+
+
+    char *line = NULL;
+    size_t len = 0;
+    size_t read;
+
+    // Execute script
+    FILE *fp = (FILE*)popen(final_command_path, "r");
+    free(final_command_path);
+
+    if (!fp) {
+        if (ack_id)
+        {
+            iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Failed to execute commnand, Skipping");
+        }
+        printf("Failed to execute commnand, Skipping\n");
+        return;
+    }
+
+    // Read stdout
+    while ((read = getline(&line, &len, fp)) != -1);
+
+    // if we have not read the entire file then something is wrong
+    if (!feof(fp))
+    {
+        if (ack_id)
+        {
+            iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Failed to read stdout commnand, Skipping");
+        }
+        printf("Failed to execute commnand, Skipping\n");
+        free(line);
+        pclose(fp);
+        return;
+    }
+
+    // Close the stdout stream and get the return code
+    int return_code = pclose(fp);
+
+    if (ack_id)
+    {
+        iotcl_mqtt_send_cmd_ack(ack_id, (return_code == 0) ? IOTCL_C2D_EVT_CMD_SUCCESS : IOTCL_C2D_EVT_CMD_FAILED, line);
+    }
+        
+    printf("Script exited with status %d\n", return_code);
+    free(line);
 }
 
 static bool is_app_version_same_as_ota(const char *version) {
@@ -136,10 +237,12 @@ static void publish_telemetry(int number_of_attributes, telemetry_attribute_t* t
             printf("failed to access input telemetry path - %s ; Skipping\n", telemetry[i].path);
             continue;
         }
+
+#ifndef REPEAT_SENT_TELEMETRY 
         struct stat file_stat;
         if (stat(telemetry[i].path, &file_stat) == -1)
         {
-            fprintf(stderr, "Error: %s\n", strerror(telemetry[i].path));
+            printf("failed to access input telemetry stat - %s ; Skipping\n", telemetry[i].path);
             continue;
         }
 
@@ -149,36 +252,20 @@ static void publish_telemetry(int number_of_attributes, telemetry_attribute_t* t
             printf("telemetry not updated since last send - %s ; Skipping\n", telemetry[i].path);
             continue;
         }
+        telemetry[i].last_accessed = modified_time;
+#endif
 
         FILE* fp = fopen(telemetry[i].path, "r");
         char* buffer = NULL;
         size_t len;
         ssize_t bytes_read = getdelim( &buffer, &len, '\0', fp);
         
+
+        iotcl_telemetry_set_string(msg, telemetry[i].name, buffer);
+
         fclose(fp);
 
-        iotcl_telemetry_set_string(msg, telemetry[i].name, APP_VERSION);
-
-        telemetry[i].last_accessed = modified_time;
-
     }
-
-    // STRING template field type
-    iotcl_telemetry_set_string(msg, "version", APP_VERSION);
-
-    // INTEGER template field type
-    int random_int =  (int) ((double) rand() / RAND_MAX * 10.0); // ger an integer from 0 to 9 first
-    iotcl_telemetry_set_number(msg, "random_int", (double) random_int);
-
-    // DECIMAL template field type
-    iotcl_telemetry_set_number(msg, "random_decimal", (double) rand() / RAND_MAX);
-
-    // BOOLEAN template field type
-    iotcl_telemetry_set_bool(msg, "random_boolean", ((double) rand() / RAND_MAX) > 0.5 ? true: false);
-
-    // OBJECT template field type with two nested DECIMAL values
-    iotcl_telemetry_set_number(msg, "coordinate.x", (double) rand() / RAND_MAX * 10.0);
-    iotcl_telemetry_set_number(msg, "coordinate.y", (double) rand() / RAND_MAX * 10.0);
 
     iotcl_mqtt_send_telemetry(msg, false);
     iotcl_telemetry_destroy(msg);
@@ -187,7 +274,7 @@ static void publish_telemetry(int number_of_attributes, telemetry_attribute_t* t
 
 static bool string_ends_with(const char * needle, const char* haystack)
 {
-    const char *str_end = haystack + strlen(haystack) -  strlen(needle);
+    const char *str_end = haystack + strlen(haystack) - strlen(needle);
     return (strncmp(str_end, needle, strlen(needle) ) == 0);
 }
 
@@ -233,17 +320,6 @@ int parse_json_to_string(char* output, cJSON* json, char* key)
     return EXIT_FAILURE;
 }
 
-char device_id[256] = {};
-char company_id[256] = {};
-char environment[256] = {};
-char iotc_server_cert_path[4096] = {};
-char sdk_id[256] = {};
-
-char connection_type_str[256] = {};
-IotConnectConnectionType connection_type = 0; 
-
-char auth_type[256] = {};
-char commands_list_path[4096] = {};
 
 
 
@@ -363,6 +439,10 @@ int main(int argc, char *argv[]) {
     cJSON* device_parser = cJSON_GetObjectItemCaseSensitive(json_parser, "device");
     parsing_result += parse_json_to_string(commands_list_path,device_parser,"commands_list_path");
 
+    if (parsing_result != 0)
+    {
+        return EXIT_FAILURE;
+    }
 
     cJSON* attribute = NULL;
     cJSON* attributes_parser = cJSON_GetObjectItemCaseSensitive(device_parser, "attributes");
@@ -406,6 +486,52 @@ int main(int argc, char *argv[]) {
     free(json_str);
 
 
+    if (access(commands_list_path, F_OK) != 0)
+    {
+        printf("failed to access scripts path - %s ; Aborting\n", commands_list_path);
+        return EXIT_FAILURE;
+    }
+
+    DIR *dir;
+    struct dirent *entry;
+    if ((dir = opendir(commands_list_path)) == NULL)
+    {
+        perror("opendir() error");
+    }
+
+    // Get the total scripts count
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp( entry->d_name, ".") == STRINGS_ARE_EQUAL || strcmp( entry->d_name, "..") == STRINGS_ARE_EQUAL)
+        {
+            continue;
+        }
+    available_scripts_count++;
+    }
+    closedir(dir);
+
+    // Re-read the dir to reset to seek back to the start
+    if ((dir = opendir(commands_list_path)) == NULL)
+    {
+        perror("opendir() error");
+    }
+
+    available_scripts = calloc(available_scripts_count, sizeof(char*));
+
+    int i = 0;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp( entry->d_name, ".") == STRINGS_ARE_EQUAL || strcmp( entry->d_name, "..") == STRINGS_ARE_EQUAL)
+        {
+            continue;
+        }
+        available_scripts[i] = calloc(strlen(entry->d_name), sizeof(char));       
+        strncpy(available_scripts[i], entry->d_name, strlen(entry->d_name));
+        i++;
+    }
+    closedir(dir);
+
+
 
 
     // char *trust_store;
@@ -413,45 +539,10 @@ int main(int argc, char *argv[]) {
     (void) argc;
     (void) argv;
 
-// #ifdef IOTCONNECT_MQTT_SERVER_CA_CERT
-//     trust_store = IOTCONNECT_CA_CERT_PATH
-// #else
-//     if (IOTCONNECT_CONNECTION_TYPE == IOTC_CT_AWS) {
-//         trust_store = IOTCONNECT_MQTT_SERVER_CA_CERT_DEFAULT_AWS;
-//     } else {
-//         trust_store = IOTCONNECT_MQTT_SERVER_CA_CERT_DEFAULT_AZURE;
-//     }
-// #endif
-
-//     if (access(trust_store, F_OK) != 0) {
-//         printf("Unable to access the MQTT CA certificate. "
-//                "Please change directory so that %s can be accessed from the application or update IOTCONNECT_CERT_PATH",
-//                trust_store);
-//         return -1;
-//     }
-
-//     if (IOTCONNECT_AUTH_TYPE == IOTC_AT_X509) {
-//         if (access(IOTCONNECT_DEVICE_CERT, F_OK) != 0
-//                 ) {
-//             printf("Unable to access device identity certificate. "
-//                    "Please change directory so that %s can be accessed from the application or update IOTCONNECT_DEVICE_CERT",
-//                    IOTCONNECT_DEVICE_CERT);
-//             return -1;
-//         }
-//         if (access(IOTCONNECT_DEVICE_PRIVATE_KEY, F_OK) != 0
-//                 ) {
-//             printf("Unable to access device identity private key. "
-//                    "Please change directory so that %s can be accessed from the application or update IOTCONNECT_DEVICE_PRIVATE_KEY",
-//                    IOTCONNECT_DEVICE_PRIVATE_KEY);
-//             return -1;
-//         }
-//     }
-
     config.cpid = company_id;
     config.env = environment;
     config.duid = device_id;
     config.connection_type = connection_type;
-    // config.auth_info.type = IOTCONNECT_AUTH_TYPE;
     config.auth_info.trust_store = iotc_server_cert_path;
     config.verbose = true;
 
@@ -508,6 +599,13 @@ int main(int argc, char *argv[]) {
         free(telemetry[i].path);
     }
     free(telemetry);
+
+    // free available scripts
+    for (int i = 0; i < available_scripts_count; i++)
+    {
+        free(available_scripts[i]);
+    }
+    free(available_scripts);
 
     return 0;
 }

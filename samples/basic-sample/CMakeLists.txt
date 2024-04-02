@@ -14,8 +14,8 @@ add_executable(basic-sample main.c)
 
 if(CMAKE_COMPILER_IS_GNUCXX)
     # expect warnings about usleep and unused arguments from paho
-    target_compile_options(basic-sample PRIVATE -std=c99 -Wall -Wextra)
-    target_compile_options(iotc-c-generic-sdk PRIVATE -std=c99 -Wall -Wextra)
+    target_compile_options(basic-sample PRIVATE -std=gnu17 -Wall -Wextra)
+    target_compile_options(iotc-c-generic-sdk PRIVATE -std=gnu17 -Wall -Wextra)
 endif(CMAKE_COMPILER_IS_GNUCXX)
 
 
