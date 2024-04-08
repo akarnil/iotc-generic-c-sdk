@@ -35,6 +35,9 @@
 #define FREE(x) if ((x)) { free(x); (x) = NULL; }
 #define REPEAT_SENT_TELEMETRY
 
+char json_path[4096] = {};
+
+
 char device_id[256] = {};
 char company_id[256] = {};
 char environment[256] = {};
@@ -49,6 +52,7 @@ char commands_list_path[4096] = {};
 
 char** available_scripts = NULL;
 int available_scripts_count = 0;
+
 
 
 typedef struct telemetry_attribute
@@ -91,15 +95,17 @@ static void on_command(IotclC2dEventData data) {
     const char *command = iotcl_c2d_get_command(data);
     const char *ack_id = iotcl_c2d_get_ack_id(data);
 
-    printf("Command %s received with %s ACK ID\n", command, ack_id ? ack_id : "no");
-
-    if (!command)
+    if (command == NULL)
     {
         printf("Failed to parse command\n");
         if (ack_id) {
             iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Internal error");
         }
+        return;
     }
+
+    printf("Command %s received with %s ACK ID\n", command, ack_id ? ack_id : "no");
+
 
     int delim_pos = strlen(command);
     for (int i = 0; i < (int)strlen(command); i++)
@@ -128,6 +134,7 @@ static void on_command(IotclC2dEventData data) {
             iotcl_mqtt_send_cmd_ack(ack_id, IOTCL_C2D_EVT_CMD_FAILED, "Command does not exist locally, Skipping");
         }
         printf("Command does not exist locally, Skipping\n");
+        // free((char*)command);
         return;
     }
 
@@ -141,11 +148,12 @@ static void on_command(IotclC2dEventData data) {
         final_command_path[strlen(commands_list_path)] = '/';
     }
     strcpy(final_command_path + strlen(final_command_path), command);
+    // free((char*)command);
 
 
     char *line = NULL;
     size_t len = 0;
-    size_t read;
+    ssize_t read;
 
     // Execute script
     FILE *fp = (FILE*)popen(final_command_path, "r");
@@ -161,7 +169,7 @@ static void on_command(IotclC2dEventData data) {
     }
 
     // Read stdout
-    while ((read = getline(&line, &len, fp)) != -1);
+    while ((read = getline(&line, &len, fp)) != -1) {}
 
     // if we have not read the entire file then something is wrong
     if (!feof(fp))
@@ -183,7 +191,7 @@ static void on_command(IotclC2dEventData data) {
     {
         iotcl_mqtt_send_cmd_ack(ack_id, (return_code == 0) ? IOTCL_C2D_EVT_CMD_SUCCESS : IOTCL_C2D_EVT_CMD_FAILED, line);
     }
-        
+
     printf("Script exited with status %d\n", return_code);
     free(line);
 }
@@ -257,12 +265,17 @@ static void publish_telemetry(int number_of_attributes, telemetry_attribute_t* t
 
         FILE* fp = fopen(telemetry[i].path, "r");
         char* buffer = NULL;
-        size_t len;
-        ssize_t bytes_read = getdelim( &buffer, &len, '\0', fp);
+        size_t len = 0;
+        
+        ssize_t read = 0;
+        read = getline(&buffer, &len, fp);
+        if (read != -1)
+        {
+            iotcl_telemetry_set_string(msg, telemetry[i].name, buffer);
+        }
         
 
-        iotcl_telemetry_set_string(msg, telemetry[i].name, buffer);
-
+        free(buffer);
         fclose(fp);
 
     }
@@ -278,7 +291,7 @@ static bool string_ends_with(const char * needle, const char* haystack)
     return (strncmp(str_end, needle, strlen(needle) ) == 0);
 }
 
-int parse_raw_json_to_string(char* output, const char * const raw_json_str, char* key)
+static int parse_raw_json_to_string(char* output, const char * const raw_json_str, char* key)
 {
     const cJSON *value = NULL;
     cJSON *json = cJSON_Parse(raw_json_str);
@@ -306,7 +319,7 @@ int parse_raw_json_to_string(char* output, const char * const raw_json_str, char
     return EXIT_FAILURE;
 }
 
-int parse_json_to_string(char* output, cJSON* json, char* key)
+static int parse_json_to_string(char* output, cJSON* json, char* key)
 {
     const cJSON *value = NULL;
     value = cJSON_GetObjectItemCaseSensitive(json, key);
@@ -333,7 +346,6 @@ int main(int argc, char *argv[]) {
     
 
     // need to pull the json path from argv
-    char json_path[4096] = "";
 
     // if (argc == 2) {};
 
@@ -518,16 +530,16 @@ int main(int argc, char *argv[]) {
 
     available_scripts = calloc(available_scripts_count, sizeof(char*));
 
-    int i = 0;
+    int itr = 0;
     while ((entry = readdir(dir)) != NULL)
     {
         if (strcmp( entry->d_name, ".") == STRINGS_ARE_EQUAL || strcmp( entry->d_name, "..") == STRINGS_ARE_EQUAL)
         {
             continue;
         }
-        available_scripts[i] = calloc(strlen(entry->d_name), sizeof(char));       
-        strncpy(available_scripts[i], entry->d_name, strlen(entry->d_name));
-        i++;
+        available_scripts[itr] = calloc(strlen(entry->d_name), sizeof(char));       
+        strncpy(available_scripts[itr], entry->d_name, strlen(entry->d_name));
+        itr++;
     }
     closedir(dir);
 
